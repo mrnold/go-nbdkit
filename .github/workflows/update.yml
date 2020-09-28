@@ -1,0 +1,107 @@
+name: Update
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Install xmllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install libxml2-utils
+      - name: Update nbdkit bindings from libguestfs.org releases
+        run: |
+          #!/usr/bin/env bash
+          RELEASES=$(curl --silent https://download.libguestfs.org/nbdkit/ | xmllint --html --noblanks --xpath "/html/body/table/tr[td/img/@alt = '[DIR]']/td[a/.]/a/text()" -)
+          git config --global user.email "marnold@redhat.com"
+          git config --global user.name "Matthew Arnold"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git pull --all --set-upstream
+          for release in ${RELEASES}
+          do
+            release=${release%?}
+            TARBALLS=$(curl --silent https://download.libguestfs.org/nbdkit/$release/ | xmllint --html --noblanks --xpath "/html/body/table/tr/td[contains(a/@href, '.tar.gz') and not(contains(a/@href, '.tar.gz.sig'))]/a/@href" -)
+            for tarball in ${TARBALLS}
+            do
+              IFS=\"$IFS read href tarball suffix <<< $tarball # Intentionally overwrite tarball
+              IFS="-.$IFS" read nbdkit major minor build suffix <<< $tarball
+              if (($major \* 100000000 + $minor \* 10000 + $build \< 100190009))
+              then # Go bindings added in 1.19.9
+                  echo Ignoring release older than 1.19.9: $release/$tarball
+                  echo
+                  continue
+              fi
+              version=$major.$minor.$build
+              tag=v$major.$minor.$build
+              echo Branch: $release Tar: $tarball Tag: $tag
+              if git rev-parse --verify $tag
+              then
+                echo Already present in repository: $tag
+              else
+                if ! (git rev-parse --verify $release || git rev-parse --verify origin/$release)
+                then
+                  echo Creating new branch: $release
+                  root=$(git rev-list --max-parents=0 HEAD)
+                  git checkout $root
+                  git checkout -b $release
+                else
+                  echo Checking out existing branch: $release
+                  git checkout $release
+                fi
+                echo Updating $release branch with new version $version
+                curl --silent https://download.libguestfs.org/nbdkit/$release/$tarball | tar -xzv --strip-components=6 nbdkit-$version/plugins/golang/src/libguestfs.org/nbdkit/
+                rm -f .gitignore
+                git add --all
+                git diff-index --quiet HEAD || git commit -m "Import nbdkit-$version"
+                git tag $tag
+              fi
+              if git rev-parse --verify $tag-cdi
+              then
+                echo Already present in repository: $tag-cdi
+              else
+                if ! (git rev-parse --verify $release-cdi || git rev-parse --verify origin/$release-cdi)
+                then    
+                  echo Creating new branch: $release-cdi
+                  root=$(git rev-list --max-parents=0 HEAD)
+                  git checkout $root
+                  git checkout -b $release-cdi
+                else
+                  echo Checking out existing branch: $release-cdi
+                  git checkout $release-cdi
+                fi
+                git checkout $tag ./
+                find . -type f -name '*.go' -exec sed -i 's/#cgo pkg-config: nbdkit/#cgo LDFLAGS: -lnbdkit/g' {} +
+                git add --all
+                git diff-index --quiet HEAD || git commit -m "Tweak nbdkit-$version for CDI build"
+                git tag $tag-cdi
+              fi
+              echo
+              echo
+            done
+          done
+          
+          latest=$(tail -n 1 <<< $release)
+          git checkout main
+          if git rev-parse --verify $release
+          then
+            echo Copy newest bindings from local $latest
+            git checkout $latest ./ 
+          elif git rev-parse --verify origin/$release
+          then    
+            echo Copy newest bindings from remote $latest
+            git checkout origin/$latest ./
+          else
+            echo Latest branch not present in local or remote? Check libguestfs.org for unpopulated directory.
+          fi
+          git diff-index --quiet HEAD || git commit -m "Update latest nbdkit bindings."
+          git push --all -u
+          git push --tags
